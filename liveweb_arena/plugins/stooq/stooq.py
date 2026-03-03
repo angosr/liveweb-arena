@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse, parse_qs
 
 from liveweb_arena.plugins.base import BasePlugin
-from .api_client import fetch_single_asset_data, fetch_homepage_api_data
+from .api_client import fetch_single_asset_data, fetch_homepage_api_data, initialize_cache
 
 
 class StooqPlugin(BasePlugin):
@@ -33,6 +33,10 @@ class StooqPlugin(BasePlugin):
         "www.stooq.com",
     ]
 
+    def initialize(self):
+        """Pre-warm homepage file cache before evaluation starts."""
+        initialize_cache()
+
     def get_blocked_patterns(self) -> List[str]:
         """Block direct CSV download and ads."""
         return [
@@ -54,17 +58,29 @@ class StooqPlugin(BasePlugin):
         return None
 
     def _get_known_symbols(self) -> set:
-        """All symbols defined in templates (cached at class level)."""
+        """All symbols defined in templates (cached at class level).
+
+        Includes bare forms (e.g. 'xom') alongside suffixed forms ('xom.us')
+        because agents commonly navigate to URLs like ?s=XOM without suffix.
+        """
         if StooqPlugin._known_symbols_cache is None:
             from .templates.variables import US_STOCKS, INDICES, CURRENCIES, COMMODITIES
             from .templates.sector_analysis import ALL_STOCKS, ALL_INDICES
             symbols = set()
-            symbols.update(s.symbol for s in US_STOCKS)
-            symbols.update(s.symbol for s in INDICES)
-            symbols.update(s.symbol for s in CURRENCIES)
-            symbols.update(s.symbol for s in COMMODITIES)
-            symbols.update(sym for sym, _ in ALL_STOCKS)
-            symbols.update(sym for sym, _ in ALL_INDICES)
+            for src in (
+                [s.symbol for s in US_STOCKS],
+                [s.symbol for s in INDICES],
+                [s.symbol for s in CURRENCIES],
+                [s.symbol for s in COMMODITIES],
+                [sym for sym, _ in ALL_STOCKS],
+                [sym for sym, _ in ALL_INDICES],
+            ):
+                for sym in src:
+                    symbols.add(sym)
+                    # Add bare form: 'xom.us' → also add 'xom'
+                    bare = sym.split(".")[0] if "." in sym else None
+                    if bare:
+                        symbols.add(bare)
             StooqPlugin._known_symbols_cache = symbols
         return StooqPlugin._known_symbols_cache
 

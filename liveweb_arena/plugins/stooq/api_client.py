@@ -11,11 +11,16 @@ from typing import Any, Dict, List, Optional
 
 import aiohttp
 
-from liveweb_arena.plugins.base_client import BaseAPIClient, RateLimiter
+from liveweb_arena.plugins.base_client import RateLimiter
 
 logger = logging.getLogger(__name__)
 
 CACHE_SOURCE = "stooq"
+
+# Global rate limiter: ALL Stooq CSV requests must go through this.
+# Shared across fetch_cache_api_data (homepage bulk) and fetch_single_asset_data (detail).
+# 0.5s interval: homepage bulk (28 symbols) completes in ~14s, under 25s prefetch timeout.
+_global_csv_limiter = RateLimiter(min_interval=0.5)
 
 # Rate limit tracking - once hit, don't retry until reset.
 # Per-context: each evaluation gets its own rate limit state via contextvars,
@@ -123,11 +128,10 @@ def _parse_stooq_csv(csv_text: str, symbol: str = "") -> Optional[Dict[str, Any]
     return result
 
 
-class StooqClient(BaseAPIClient):
+class StooqClient:
     """Stooq CSV API client with rate limiting."""
 
     CSV_URL = "https://stooq.com/q/d/l/"
-    _rate_limiter = RateLimiter(min_interval=0.5)
 
     @classmethod
     async def get_price_data(
@@ -166,8 +170,8 @@ class StooqClient(BaseAPIClient):
                 "Wait for daily reset or manually populate cache."
             )
 
-        # Fall back to live API
-        await cls._rate_limit()
+        # Global rate limiter shared with all Stooq CSV requests
+        await _global_csv_limiter.wait()
 
         try:
             async with aiohttp.ClientSession() as session:
@@ -242,12 +246,12 @@ async def fetch_cache_api_data() -> Optional[Dict[str, Any]]:
     }
     failed = 0
 
-    # Rate limit: max 5 concurrent requests, reuse single session
-    semaphore = asyncio.Semaphore(5)
-
-    async def fetch_one(session: aiohttp.ClientSession, symbol: str):
-        nonlocal failed
-        async with semaphore:
+    # Sequential fetch with global rate limiter — avoid IP bans
+    async with aiohttp.ClientSession(
+        headers={"User-Agent": "Mozilla/5.0"},
+    ) as session:
+        for symbol in assets:
+            await _global_csv_limiter.wait()
             try:
                 url = f"https://stooq.com/q/d/l/?s={symbol}&i=d"
                 async with session.get(
@@ -256,12 +260,13 @@ async def fetch_cache_api_data() -> Optional[Dict[str, Any]]:
                 ) as response:
                     if response.status != 200:
                         failed += 1
-                        return
+                        continue
 
                     text = await response.text()
                     if "Exceeded the daily hits limit" in text:
-                        failed += 1
-                        return
+                        _rate_limited.set(True)
+                        logger.error("Stooq API daily limit exceeded during bulk fetch")
+                        break
 
                     parsed = _parse_stooq_csv(text, symbol)
                     if parsed:
@@ -269,12 +274,6 @@ async def fetch_cache_api_data() -> Optional[Dict[str, Any]]:
 
             except Exception:
                 failed += 1
-
-    # Fetch all with concurrency control and shared session
-    async with aiohttp.ClientSession(
-        headers={"User-Agent": "Mozilla/5.0"},
-    ) as session:
-        await asyncio.gather(*[fetch_one(session, s) for s in assets])
 
     result["_meta"]["asset_count"] = len(result["assets"])
     logger.info(f"Fetched {len(result['assets'])} assets from Stooq ({failed} failed)")
@@ -291,6 +290,40 @@ def _get_cache_ttl() -> int:
     """Get cache TTL from environment."""
     from liveweb_arena.core.cache import DEFAULT_TTL
     return int(os.environ.get("LIVEWEB_CACHE_TTL", str(DEFAULT_TTL)))
+
+
+def initialize_cache():
+    """
+    Pre-warm homepage file cache synchronously.
+
+    Called by plugin.initialize() before evaluation starts (no timeout pressure).
+    If file cache is valid, this is a no-op. Otherwise fetches all homepage
+    symbols sequentially with rate limiting.
+    """
+    cache_file = _get_file_cache_path()
+    ttl = _get_cache_ttl()
+
+    # Already cached and valid?
+    if cache_file.exists():
+        try:
+            cached = json.loads(cache_file.read_text())
+            if time.time() - cached.get("_fetched_at", 0) < ttl:
+                assets = cached.get("assets", {})
+                if assets:
+                    logger.info(f"Stooq init: {len(assets)} assets from file cache")
+                    return
+        except Exception:
+            pass
+
+    # Fetch and cache
+    logger.info("Stooq init: pre-warming homepage cache...")
+    loop = asyncio.get_event_loop()
+    if loop.is_running():
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            pool.submit(lambda: asyncio.run(fetch_homepage_api_data())).result()
+    else:
+        asyncio.run(fetch_homepage_api_data())
 
 
 async def fetch_homepage_api_data() -> Dict[str, Any]:
@@ -357,6 +390,7 @@ async def fetch_single_asset_data(symbol: str) -> Optional[Dict[str, Any]]:
         variants = [f"{symbol}.us", symbol]
 
     for sym in variants:
+        await _global_csv_limiter.wait()
         try:
             async with aiohttp.ClientSession() as session:
                 url = f"https://stooq.com/q/d/l/?s={sym}&i=d"
